@@ -1,73 +1,81 @@
 import uvicorn
 from fastapi import FastAPI, Response
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import io
 import os
-import numpy as np
+import datetime
+from database_manager import PhotoDB
 
 app = FastAPI()
+db = PhotoDB()
 
 # 配置区
-TEST_IMAGE_PATH = "test.jpg"
-# 假设你的墨水屏是 7.3 寸，分辨率通常是 800x480
 SCREEN_WIDTH = 800
 SCREEN_HEIGHT = 480
+FONT_PATH = "simhei.ttf" # 你需要准备一个中文字体文件在同级目录
 
-def apply_4color_dithering(image_path):
+def create_layout(image_path, caption, date_str):
     """
-    将图片转换为黑、白、红、黄四色，并应用抖动算法
+    排版引擎：将照片、文案、日期合成为一张墨水屏海报
     """
-    # 1. 打开并调整大小（按比例裁剪填充）
-    img = Image.open(image_path).convert('RGB')
-    img = img.resize((SCREEN_WIDTH, SCREEN_HEIGHT), Image.Resampling.LANCZOS)
-
-    # 2. 定义墨水屏的 4 色调色板 (黑, 白, 红, 黄)
-    # 每个颜色由 RGB 三个分量组成
-    palette_data = [
-        0,   0,   0,    # 黑
-        255, 255, 255,  # 白
-        255, 0,   0,    # 红
-        255, 255, 0,    # 黄
-    ]
-    # 填充调色板到 256 种颜色（Pillow 要求的格式）
-    palette_data += [0] * (768 - len(palette_data))
+    # 1. 创建画布
+    canvas = Image.new('RGB', (SCREEN_WIDTH, SCREEN_HEIGHT), (255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
     
-    # 创建一个调色板图像容器
+    # 2. 处理照片 (留出白边，类似拍立得效果)
+    photo = Image.open(image_path).convert('RGB')
+    photo.thumbnail((700, 350)) # 缩放照片
+    photo_x = (SCREEN_WIDTH - photo.width) // 2
+    photo_y = 30
+    canvas.paste(photo, (photo_x, photo_y))
+    
+    # 3. 绘制文字 (日期和文案)
+    try:
+        font_main = ImageFont.truetype(FONT_PATH, 24)
+        font_date = ImageFont.truetype(FONT_PATH, 18)
+    except:
+        font_main = ImageFont.load_default()
+        font_date = ImageFont.load_default()
+
+    # 绘制文案
+    text_w = draw.textlength(caption, font=font_main)
+    draw.text(((SCREEN_WIDTH - text_w) // 2, 400), caption, fill=(0, 0, 0), font=font_main)
+    
+    # 绘制日期
+    draw.text((650, 440), date_str, fill=(255, 0, 0), font=font_date) # 红色日期
+
+    return canvas
+
+def apply_4color_dithering(img):
+    """应用抖动算法 (直接对 Image 对象处理)"""
+    palette_data = [0,0,0, 255,255,255, 255,0,0, 255,255,0] + [0]*756
     palette_img = Image.new('P', (1, 1))
     palette_img.putpalette(palette_data)
-
-    # 3. 核心步骤：量化并应用 Floyd-Steinberg 抖动
-    # dither=Image.FLOYDSTEINBERG 会自动处理误差扩散
-    dithered_img = img.quantize(palette=palette_img, dither=Image.FLOYDSTEINBERG)
     
-    # 4. 转回 RGB 以便预览或以 JPG/PNG 格式发送给 ESP32
-    return dithered_img.convert('RGB')
-
-@app.get("/")
-def read_root():
-    return {"status": "InkTime Dithering Server is running"}
+    dithered = img.quantize(palette=palette_img, dither=Image.FLOYDSTEINBERG)
+    return dithered.convert('RGB')
 
 @app.get("/get_image")
 async def get_image():
-    """
-    ESP32 调用此接口获取处理后的图片
-    """
-    if not os.path.exists(TEST_IMAGE_PATH):
-        # 兜底：如果没有图片，返回一个黄色背景
-        img = Image.new('RGB', (SCREEN_WIDTH, SCREEN_HEIGHT), color=(255, 255, 0))
-    else:
-        print(f"正在处理图片: {TEST_IMAGE_PATH} ...")
-        img = apply_4color_dithering(TEST_IMAGE_PATH)
-
-    # 将处理后的图片存入内存
-    buf = io.BytesIO()
-    # 为了让 ESP32 容易解析，我们先传 BMP 格式（无损且结构简单）
-    # 或者为了节省流量传 JPEG
-    img.save(buf, format="JPEG", quality=85)
-    byte_data = buf.getvalue()
+    # 1. 从数据库选片
+    record = db.get_best_photo_of_today()
     
-    print(f"处理完成！发送四色抖动图，大小: {len(byte_data)} 字节")
-    return Response(content=byte_data, media_type="image/jpeg")
+    if record:
+        img_path, date_str, caption = record[1], record[2], record[4]
+    else:
+        # 默认占位
+        img_path, date_str, caption = "test.jpg", "Today", "今天没有发现值得回忆的瞬间。"
+
+    # 2. 排版
+    final_img = create_layout(img_path, caption, date_str)
+    
+    # 3. 抖动算法处理
+    final_img = apply_4color_dithering(final_img)
+
+    # 4. 返回
+    buf = io.BytesIO()
+    final_img.save(buf, format="JPEG", quality=85)
+    return Response(content=buf.getvalue(), media_type="image/jpeg")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
